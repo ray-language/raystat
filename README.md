@@ -100,6 +100,7 @@ make bench         # pérdida y rendimiento por número de receptoras (SERIES=N)
 |---|---|
 | Protocolo, fusión, ventana, página, servicio | **12 tests** en VM y nativo (raylang 1.27.65, net 0.10.1) |
 | De punta a punta | UDP de entrada, `/metrics` por HTTP, 5000 líneas del generador sin pérdida, parada limpia |
+| Windows x86_64 | en CI. En la VM del runner se perdió el 30 % de 5000 líneas enviadas a 2000 datagramas/s, sin forma de agrandar el búfer (#208); ahí el test solo exige que lleguen |
 | Windows arm64 | no compila en nativo: `worker_id()` no existe allí (#197) |
 
 Pendiente: histogramas de Prometheus con buckets configurables, persistir los contadores entre
