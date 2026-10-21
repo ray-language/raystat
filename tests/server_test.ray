@@ -1,0 +1,102 @@
+// The service end to end, in one test (OS listeners outlive a test's fibers): datagrams in on
+// UDP, the page out on HTTP, flushes, and a clean stop.
+
+import std/net;
+import std/time;
+import net/udp;
+import blast;
+import server;
+
+fn http_get(port: int, path: string) -> string {
+    let c = net.tcp_connect("127.0.0.1", port).unwrap();
+    net.set_read_timeout(c, 5000);
+    net.socket_write(c, "GET ${path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    var out = "";
+    while (true) {
+        match (net.socket_read(c)) {
+            Result.Ok(s) => if (s == "") {
+                break;
+            } else {
+                out = out + s;
+            },
+            Result.Err(_) => break,
+        }
+    }
+    close(c);
+    out
+}
+
+fn line_value(page: string, prefix: string) -> int {
+    for l in page.split("\n") {
+        if (l.starts_with(prefix + " ")) {
+            return parse_int(l.substring(prefix.len() + 1, l.len())).unwrap_or(-1);
+        }
+    }
+    -1
+}
+
+@test
+fn statsd_in_prometheus_out() {
+    let cfg = server.Config {
+        udp_host: "127.0.0.1",
+        udp_port: 0,
+        http_host: "127.0.0.1",
+        http_port: 0,
+        flush_ms: 60000,
+        window_ms: 60000,
+        receivers: 3,
+        quantiles: [0.5, 0.99]
+    };
+    let listener = server.listen_http(cfg).unwrap();
+    let http_port = net.local_port(listener);
+    let run = server.start(cfg).unwrap();
+    let stop_http: Channel<int> = Channel.bounded(1);
+    let served: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        send(served, server.serve_http(listener, run, stop_http, true));
+    });
+    let s = udp.bind("127.0.0.1", 0).unwrap();
+    for p in [
+        "api.requests:1|c|#method:get",
+        "api.requests:2|c|#method:get",
+        "lat:10|ms\nlat:30|ms",
+        "temp:21.5|g",
+        "broken"
+    ] {
+        udp.send_to(s, "127.0.0.1", run.udp_port, p.to_bytes()).unwrap();
+    }
+    // A paced burst from the load generator: 5000 counter lines in 500 datagrams.
+    let (sent, _, err) = blast.run(
+        blast.Plan {
+            host: "127.0.0.1",
+            port: run.udp_port,
+            lines: 5000,
+            senders: 2,
+            batch: 10,
+            series: 5,
+            rate: 2000
+        }
+    );
+    assert_eq(sent, 5000);
+    assert_eq(err, "");
+    time.sleep(300);
+    server.flush_now(run.asks);
+    let resp = http_get(http_port, "/metrics");
+    assert(resp.starts_with("HTTP/1.1 200"));
+    assert(resp.contains("text/plain; version=0.0.4"));
+    assert(resp.contains("api_requests_total{method=\"get\"} 3"));
+    assert(resp.contains("lat{quantile=\"0.5\"} 10"));
+    assert(resp.contains("lat{quantile=\"0.99\"} 30"));
+    assert(resp.contains("temp 21.5"));
+    assert_eq(line_value(resp, "raystat_bad_lines_total"), 1);
+    var hits = 0;
+    for i in 0..5 {
+        hits = hits + line_value(resp, "blast_hits_total{series=\"${i}\"}");
+    }
+    // Paced and local: nothing lost.
+    assert_eq(hits, 5000);
+    assert(http_get(http_port, "/healthz").contains("ok"));
+    assert(http_get(http_port, "/nope").starts_with("HTTP/1.1 404"));
+    send(stop_http, 1);
+    assert_eq(recv(served).unwrap(), Result.Ok(0));
+}

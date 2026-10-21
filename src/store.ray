@@ -1,0 +1,339 @@
+//! What `/metrics` shows: the shards of each flush merged into running state, rendered in the
+//! Prometheus text format.
+//!
+//! - counters are cumulative (`name_total`), as Prometheus expects; statsd's per-interval counts
+//!   are its `rate()`;
+//! - gauges keep their last value (the latest across shards wins; deltas add up);
+//! - timers are summaries: quantiles over the last `window` (a minute by default), `_sum`/`_count`
+//!   cumulative;
+//! - sets are gauges: distinct members seen in the last `window`.
+//!
+//! The window is a ring of the last flushes; each flush keeps at most `KEEP_PER_FLUSH` samples
+//! per timer (a random sample of them when there are more), so memory does not grow with traffic.
+
+import std/math;
+import std/random;
+import std/time;
+import shard;
+from shard import Shard, Timer;
+
+pub struct Summary {
+    count: int,
+    sum: float,
+    min: float,
+    max: float,
+    quantiles: [(float, float)],
+}
+
+/// Timer samples kept per series per flush inside the window.
+pub const KEEP_PER_FLUSH: int = 1024;
+
+pub struct Store {
+    quantiles: [float],
+    window_ms: int,
+    /// Per series, the samples of each flush in the window, with the flush time.
+    samples: Map<string, [(int, [float])]>,
+    members: Map<string, [(int, Map<string, bool>)]>,
+    counters: Map<string, float>,
+    gauges: Map<string, (float, int)>,
+    window: Map<string, Summary>,
+    timer_count: Map<string, int>,
+    timer_sum: Map<string, float>,
+    sets: Map<string, int>,
+    names: Map<string, string>,
+    kinds: Map<string, string>,
+    packets: int,
+    lines: int,
+    bad: int,
+    last_error: string,
+    flushes: int,
+    /// How long the last merge took, in microseconds.
+    merge_us: int,
+    merge_max_us: int,
+    /// Per receiver: the worker it runs on and the datagrams it took.
+    receivers: Map<int, (int, int)>,
+}
+
+pub fn new(quantiles: [float], window_ms: int) -> Store {
+    Store {
+        quantiles: quantiles,
+        window_ms: window_ms,
+        samples: Map.new(),
+        members: Map.new(),
+        counters: Map.new(),
+        gauges: Map.new(),
+        window: Map.new(),
+        timer_count: Map.new(),
+        timer_sum: Map.new(),
+        sets: Map.new(),
+        names: Map.new(),
+        kinds: Map.new(),
+        packets: 0,
+        lines: 0,
+        bad: 0,
+        last_error: "",
+        flushes: 0,
+        merge_us: 0,
+        merge_max_us: 0,
+        receivers: Map.new()
+    }
+}
+
+/// The value at quantile `q` of sorted samples (nearest rank).
+pub fn quantile(sorted: [float], q: float) -> float {
+    if (sorted.len() == 0) {
+        return 0.0;
+    }
+    let rank = math.ceil(q * (sorted.len() as float)) as int;
+    let i = if (rank < 1) {
+        0
+    } else if (rank > sorted.len()) {
+        sorted.len() - 1
+    } else {
+        rank - 1
+    };
+    sorted[i]
+}
+
+fn note(st: Store, series: string, name: string, kind: string) {
+    st.names.insert(series, name);
+    st.kinds.insert(series, kind);
+}
+
+/// At most `n` of `xs`, chosen at random (all of them if there are fewer).
+fn thin(xs: [float], n: int) -> [float] {
+    if (xs.len() <= n) {
+        return xs;
+    }
+    let out: [float] = [];
+    var i = 0;
+    // Selection sampling (Knuth's algorithm S): each element kept with the right odds.
+    while (out.len() < n) {
+        let left = xs.len() - i;
+        if (random.below(left) < n - out.len()) {
+            out.push(xs[i]);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// Folds one flush's shards into the store; `now` is the flush time (ms, any clock).
+pub fn merge(st: Store, shards: [Shard], now: int) {
+    let started = time.monotonic_nanos();
+    let timers: Map<string, Timer> = Map.new();
+    let members: Map<string, Map<string, bool>> = Map.new();
+    let gauge_moves: Map<string, float> = Map.new();
+    for sh in shards {
+        let (_, before) = st.receivers.get_or(sh.receiver, (sh.worker, 0));
+        st.receivers.insert(sh.receiver, (sh.worker, before + sh.packets));
+        st.packets = st.packets + sh.packets;
+        st.lines = st.lines + sh.lines;
+        st.bad = st.bad + sh.bad;
+        if (sh.last_error != "") {
+            st.last_error = sh.last_error;
+        }
+        for (k, v) in sh.counters {
+            st.counters.insert(k, st.counters.get_or(k, 0.0) + v);
+            note(st, k, sh.names.get_or(k, k), "counter");
+        }
+        for (k, v) in sh.gauges {
+            let (value, at) = v;
+            let newer = match (st.gauges.get(k)) {
+                Option.Some((_, prev_at)) => at >= prev_at,
+                Option.None => true,
+            };
+            if (newer) {
+                st.gauges.insert(k, (value, at));
+            }
+            note(st, k, sh.names.get_or(k, k), "gauge");
+        }
+        for (k, d) in sh.gauge_deltas {
+            gauge_moves.insert(k, gauge_moves.get_or(k, 0.0) + d);
+            note(st, k, sh.names.get_or(k, k), "gauge");
+        }
+        for (k, t) in sh.timers {
+            match (timers.get(k)) {
+                Option.Some(acc) => {
+                    acc.count = acc.count + t.count;
+                    acc.sum = acc.sum + t.sum;
+                    acc.min = if (t.min < acc.min) { t.min } else { acc.min };
+                    acc.max = if (t.max > acc.max) { t.max } else { acc.max };
+                    for v in t.samples {
+                        acc.samples.push(v);
+                    }
+                },
+                Option.None => timers.insert(k, t),
+            }
+            note(st, k, sh.names.get_or(k, k), "summary");
+        }
+        for (k, m) in sh.sets {
+            match (members.get(k)) {
+                Option.Some(acc) => {
+                    for (member, _) in m {
+                        acc.insert(member, true);
+                    }
+                },
+                Option.None => members.insert(k, m),
+            }
+            note(st, k, sh.names.get_or(k, k), "set");
+        }
+    }
+    for (k, d) in gauge_moves {
+        let (v, at) = st.gauges.get_or(k, (0.0, 0));
+        st.gauges.insert(k, (v + d, at));
+    }
+    for (k, t) in timers {
+        st.timer_count.insert(k, st.timer_count.get_or(k, 0) + t.count);
+        st.timer_sum.insert(k, st.timer_sum.get_or(k, 0.0) + t.sum);
+        let ring = st.samples.get_or(k, []);
+        let kept = thin(t.samples, KEEP_PER_FLUSH);
+        // When samples were dropped (reservoir, thinning), the exact min and max of the flush may
+        // be among them: add them back so the extreme quantiles still reach them.
+        if (t.count > kept.len()) {
+            kept.push(t.min);
+            kept.push(t.max);
+        }
+        ring.push((now, kept));
+        st.samples.insert(k, ring);
+    }
+    for (k, m) in members {
+        let ring = st.members.get_or(k, []);
+        ring.push((now, m));
+        st.members.insert(k, ring);
+    }
+    // Drop what left the window, then summarize what is in it.
+    let since = now - st.window_ms;
+    st.window = Map.new();
+    for k in st.samples.keys() {
+        let ring = st.samples.get(k).unwrap();
+        let kept = ring.filter(fn(e: (int, [float])) -> bool { e.0 > since });
+        st.samples.insert(k, kept);
+        let all: [float] = [];
+        for e in kept {
+            for v in e.1 {
+                all.push(v);
+            }
+        }
+        if (all.len() > 0) {
+            let sorted = sort(all);
+            let qs = st.quantiles.map(fn(q: float) -> (float, float) { (q, quantile(sorted, q)) });
+            st.window.insert(
+                k,
+                Summary {
+                    count: all.len(),
+                    sum: 0.0,
+                    min: sorted[0],
+                    max: sorted[sorted.len() - 1],
+                    quantiles: qs
+                }
+            );
+        }
+    }
+    st.sets = Map.new();
+    for k in st.members.keys() {
+        let ring = st.members.get(k).unwrap();
+        let kept = ring.filter(fn(e: (int, Map<string, bool>)) -> bool { e.0 > since });
+        st.members.insert(k, kept);
+        let union: Map<string, bool> = Map.new();
+        for e in kept {
+            for (member, _) in e.1 {
+                union.insert(member, true);
+            }
+        }
+        st.sets.insert(k, union.keys().len());
+    }
+    st.flushes = st.flushes + 1;
+    st.merge_us = (time.monotonic_nanos() - started) / 1000;
+    if (st.merge_us > st.merge_max_us) {
+        st.merge_max_us = st.merge_us;
+    }
+}
+
+fn num(v: float) -> string {
+    if (v == math.floor(v) && math.abs(v) < 1000000000000000.0) {
+        to_string(v as int)
+    } else {
+        to_string(v)
+    }
+}
+
+/// `{a="1"}` of a series, or "".
+fn labels_of(series: string) -> string {
+    match (series.index_of("{")) {
+        Option.Some(i) => series.substring(i, series.len()),
+        Option.None => "",
+    }
+}
+
+/// The labels with one more: `{quantile="0.5",a="1"}`.
+fn with_label(labels: string, extra: string) -> string {
+    if (labels == "") { "{${extra}}" } else { "{${extra},${labels.substring(1, labels.len())}" }
+}
+
+/// The Prometheus text exposition (version 0.0.4).
+pub fn render(st: Store) -> string {
+    let out: [string] = [];
+    // One `# TYPE` per metric name, its series together, names sorted.
+    let by_name: Map<string, [string]> = Map.new();
+    for (series, name) in st.names {
+        match (by_name.get(name)) {
+            Option.Some(list) => list.push(series),
+            Option.None => by_name.insert(name, [series]),
+        }
+    }
+    for name in sort(by_name.keys()) {
+        let series = sort(by_name.get(name).unwrap());
+        let kind = st.kinds.get_or(series[0], "untyped");
+        if (kind == "counter") {
+            out.push("# TYPE ${name}_total counter");
+            for s in series {
+                out.push("${name}_total${labels_of(s)} ${num(st.counters.get_or(s, 0.0))}");
+            }
+        } else if (kind == "gauge" || kind == "set") {
+            out.push("# TYPE ${name} gauge");
+            for s in series {
+                let v = if (kind == "set") {
+                    st.sets.get_or(s, 0) as float
+                } else {
+                    st.gauges.get_or(s, (0.0, 0)).0
+                };
+                out.push("${name}${labels_of(s)} ${num(v)}");
+            }
+        } else {
+            out.push("# TYPE ${name} summary");
+            for s in series {
+                let l = labels_of(s);
+                if let Option.Some(w) = st.window.get(s) {
+                    for (q, v) in w.quantiles {
+                        out.push(
+                            "${name}${with_label(l, "quantile=\"${to_string(q)}\"")} ${num(v)}"
+                        );
+                    }
+                }
+                out.push("${name}_sum${l} ${num(st.timer_sum.get_or(s, 0.0))}");
+                out.push("${name}_count${l} ${st.timer_count.get_or(s, 0)}");
+            }
+        }
+    }
+    out.push("# TYPE raystat_packets_total counter");
+    out.push("raystat_packets_total ${st.packets}");
+    out.push("# TYPE raystat_lines_total counter");
+    out.push("raystat_lines_total ${st.lines}");
+    out.push("# TYPE raystat_bad_lines_total counter");
+    out.push("raystat_bad_lines_total ${st.bad}");
+    out.push("# TYPE raystat_receiver_packets_total counter");
+    for r in sort(st.receivers.keys()) {
+        let (w, n) = st.receivers.get(r).unwrap();
+        out.push("raystat_receiver_packets_total{receiver=\"${r}\",worker=\"${w}\"} ${n}");
+    }
+    out.push("# TYPE raystat_flushes_total counter");
+    out.push("raystat_flushes_total ${st.flushes}");
+    out.push("# TYPE raystat_merge_seconds gauge");
+    out.push("raystat_merge_seconds ${to_string((st.merge_us as float) / 1000000.0)}");
+    out.push("# TYPE raystat_merge_seconds_max gauge");
+    out.push("raystat_merge_seconds_max ${to_string((st.merge_max_us as float) / 1000000.0)}");
+    out.push("# TYPE raystat_series gauge");
+    out.push("raystat_series ${st.names.keys().len()}");
+    join(out, "\n") + "\n"
+}

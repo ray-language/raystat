@@ -1,0 +1,164 @@
+//! The statsd line protocol, with DogStatsD tags:
+//!
+//!   name:value|type[|@rate][|#tag:value,tag2:value]
+//!
+//! types: `c` counter, `g` gauge (`+n`/`-n` move it), `ms`/`h`/`d` timer or histogram, `s` set.
+//! A datagram holds one or more lines separated by `\n`. Parsing works on the bytes (octet by
+//! octet, no string per field until a field is kept).
+
+pub enum Kind {
+    Counter,
+    Gauge,
+    GaugeDelta,
+    Timer,
+    Set,
+}
+
+pub struct Sample {
+    /// The series: Prometheus-safe name plus sorted labels, `api_requests{method="get"}`.
+    series: string,
+    name: string,
+    kind: Kind,
+    value: float,
+    /// The member of a set (its value as text).
+    member: string,
+}
+
+fn sanitize(name: string) -> string {
+    let out: [string] = [];
+    var first = true;
+    for c in name.chars() {
+        let ok = (c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || c == '_'
+            || c == ':'
+            || (!first && c >= '0' && c <= '9');
+        out.push(if (ok) { to_string(c) } else { "_" });
+        first = false;
+    }
+    join(out, "")
+}
+
+fn escape_label(v: string) -> string {
+    v.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+}
+
+/// `{a="1",b="x"}` from `a:1,b:x` (sorted by key; a tag without `:` gets the value "true").
+fn labels(tags: string) -> string {
+    if (tags == "") {
+        return "";
+    }
+    let pairs: [string] = [];
+    for t in tags.split(",") {
+        if (t == "") {
+            continue;
+        }
+        match (t.index_of(":")) {
+            Option.Some(i) => pairs.push(
+                "${sanitize(t.substring(0, i))}=\"${escape_label(t.substring(i + 1, t.len()))}\""
+            ),
+            Option.None => pairs.push("${sanitize(t)}=\"true\""),
+        }
+    }
+    if (pairs.len() == 0) {
+        return "";
+    }
+    "{${join(sort(pairs), ",")}}"
+}
+
+/// Parses one line; `Err` names what is wrong.
+pub fn parse_line(line: string) -> Result<Sample, string> {
+    let colon = line.index_of(":").ok_or("no ':' in '${line}'")?;
+    let name = line.substring(0, colon);
+    if (name == "") {
+        return Result.Err("empty name in '${line}'");
+    }
+    let fields = line.substring(colon + 1, line.len()).split("|");
+    if (fields.len() < 2) {
+        return Result.Err("no type in '${line}'");
+    }
+    let raw = fields[0];
+    let ty = fields[1];
+    var rate = 1.0;
+    var tags = "";
+    for i in 2..fields.len() {
+        let f = fields[i];
+        if (f.starts_with("@")) {
+            rate = parse_float(f.substring(1, f.len())).ok_or("bad sample rate in '${line}'")?;
+            if (rate <= 0.0 || rate > 1.0) {
+                return Result.Err("sample rate out of (0, 1] in '${line}'");
+            }
+        } else if (f.starts_with("#")) {
+            tags = f.substring(1, f.len());
+        }
+    }
+    let base = sanitize(name);
+    let series = base + labels(tags);
+    if (ty == "s") {
+        return Result.Ok(
+            Sample { series: series, name: base, kind: Kind.Set, value: 0.0, member: raw }
+        );
+    }
+    let v = parse_float(raw).ok_or("bad value '${raw}' in '${line}'")?;
+    if (ty == "c") {
+        return Result.Ok(
+            Sample { series: series, name: base, kind: Kind.Counter, value: v / rate, member: "" }
+        );
+    }
+    if (ty == "g") {
+        let delta = raw.starts_with("+") || raw.starts_with("-");
+        return Result.Ok(
+            Sample {
+                series: series,
+                name: base,
+                kind: if (delta) { Kind.GaugeDelta } else { Kind.Gauge },
+                value: v,
+                member: ""
+            }
+        );
+    }
+    if (ty == "ms" || ty == "h" || ty == "d") {
+        return Result.Ok(
+            Sample { series: series, name: base, kind: Kind.Timer, value: v, member: "" }
+        );
+    }
+    Result.Err("unknown type '${ty}' in '${line}'")
+}
+
+/// Splits a datagram into lines (by octet: `\n` = 10) and parses each. Returns the samples and
+/// the number of bad lines; `bad` gets the first error.
+pub fn parse_packet(data: bytes, out: [Sample]) -> (int, string) {
+    var bad = 0;
+    var first = "";
+    var start = 0;
+    let n = data.len();
+    var i = 0;
+    while (i <= n) {
+        if (i == n || data[i] == 10) {
+            if (i > start) {
+                // A line ending in \r (from a Windows sender) loses it.
+                let end = if (data[i - 1] == 13) { i - 1 } else { i };
+                match (from_utf8(data.sub_bytes(start, end))) {
+                    Result.Ok(text) => match (parse_line(text)) {
+                        Result.Ok(s) => out.push(s),
+                        Result.Err(e) => {
+                            bad = bad + 1;
+                            if (first == "") {
+                                first = e;
+                            }
+                        },
+                    },
+                    Result.Err(_) => {
+                        bad = bad + 1;
+                        if (first == "") {
+                            first = "a line that is not UTF-8";
+                        }
+                    },
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    (bad, first)
+}

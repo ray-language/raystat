@@ -1,0 +1,83 @@
+// The statsd line protocol.
+
+import line;
+from line import Kind, Sample;
+
+fn one(l: string) -> Sample {
+    line.parse_line(l).unwrap()
+}
+
+fn err(l: string) -> string {
+    match (line.parse_line(l)) {
+        Result.Ok(_) => panic("accepted: ${l}"),
+        Result.Err(e) => e,
+    }
+}
+
+fn kind(s: Sample) -> string {
+    match (s.kind) {
+        Kind.Counter => "c",
+        Kind.Gauge => "g",
+        Kind.GaugeDelta => "g+",
+        Kind.Timer => "ms",
+        Kind.Set => "s",
+    }
+}
+
+@test
+fn the_types() {
+    let c = one("api.requests:3|c");
+    assert_eq(c.series, "api_requests");
+    assert_eq(kind(c), "c");
+    assert_eq(c.value, 3.0);
+    assert_eq(kind(one("q:12|g")), "g");
+    assert_eq(kind(one("q:-3|g")), "g+");
+    assert_eq(one("q:-3|g").value, -3.0);
+    assert_eq(kind(one("lat:12.5|ms")), "ms");
+    assert_eq(kind(one("lat:12|h")), "ms");
+    assert_eq(kind(one("lat:12|d")), "ms");
+    let s = one("users:ana|s");
+    assert_eq(kind(s), "s");
+    assert_eq(s.member, "ana");
+}
+
+@test
+fn sample_rates_and_tags() {
+    // A counter sampled at 10 % stands for ten times its value.
+    assert_eq(one("hits:1|c|@0.1").value, 10.0);
+    let t = one("api.requests:1|c|#method:get,code:200,canary");
+    assert_eq(t.series, "api_requests{canary=\"true\",code=\"200\",method=\"get\"}");
+    assert_eq(t.name, "api_requests");
+    // Tag order does not make a new series.
+    assert_eq(one("a:1|c|#y:2,x:1").series, one("a:1|c|#x:1,y:2").series);
+    assert_eq(one("a:1|c|@0.5|#x:1").series, "a{x=\"1\"}");
+    assert_eq(one("a:1|c|#path:/a\"b").series, "a{path=\"/a\\\"b\"}");
+}
+
+@test
+fn names_become_prometheus_names() {
+    assert_eq(one("my-app.http/requests:1|c").series, "my_app_http_requests");
+    assert_eq(one("9lives:1|c").series, "_lives");
+}
+
+@test
+fn bad_lines() {
+    assert(err("no colon here").contains("no ':'"));
+    assert(err("a:1").contains("no type"));
+    assert(err("a:x|c").contains("bad value"));
+    assert(err("a:1|q").contains("unknown type"));
+    assert(err("a:1|c|@2").contains("out of"));
+    assert(err(":1|c").contains("empty name"));
+}
+
+@test
+fn a_packet_holds_many_lines() {
+    let out: [Sample] = [];
+    let (bad, first) = line.parse_packet(b"a:1|c\nb:2|g\r\n\nnonsense\nc:3|ms\n", out);
+    assert_eq(out.len(), 3);
+    assert_eq(bad, 1);
+    assert(first.contains("nonsense"));
+    let none: [Sample] = [];
+    assert_eq(line.parse_packet(b"", none), (0, ""));
+    assert_eq(line.parse_packet(b"\xff\xfe:1|c", none).0, 1);
+}

@@ -1,0 +1,160 @@
+//! raystat: statsd in (UDP), Prometheus out (HTTP).
+//!
+//!   raystat serve [--udp HOST:PORT] [--http HOST:PORT] [--flush 10s] [--receivers N] [--quantiles 0.5,0.9,0.99]
+//!   raystat blast HOST:PORT [-n LINES] [-s SENDERS] [-b LINES_PER_PACKET] [--series N] [--rate PACKETS/S]
+
+import std/net;
+import std/time;
+import blast;
+import server;
+
+const VERSION: string = "0.1.0";
+
+const USAGE: string = `usage:
+  raystat serve [options]          receive statsd on UDP, serve /metrics on HTTP
+    --udp HOST:PORT                 default 127.0.0.1:8125
+    --http HOST:PORT                default 127.0.0.1:9102
+    --flush DURATION                how often the receivers' state is merged (default 10s; ms, s, m)
+    --window DURATION               what timer quantiles and set sizes cover (default 1m)
+    --receivers N                   receiving fibers on the UDP socket (default: one per worker)
+    --quantiles LIST                timer quantiles (default 0.5,0.9,0.99)
+  raystat blast HOST:PORT [options] send counter lines as fast as possible (a load test)
+    -n LINES                        default 1000000
+    -s SENDERS                      sending fibers (default 4)
+    -b LINES                        lines per datagram (default 10)
+    --series N                      distinct series (default 100)
+    --rate N                        datagrams per second per sender (default: no limit)`;
+
+fn host_port(s: string, what: string) -> Result<(string, int), string> {
+    let i = s.last_index_of(":").ok_or("${what}: expected HOST:PORT, got '${s}'")?;
+    let host = if (i == 0) { "127.0.0.1" } else { s.substring(0, i) };
+    let port = parse_int(s.substring(i + 1, s.len())).ok_or("${what}: bad port in '${s}'")?;
+    Result.Ok((host, port))
+}
+
+fn duration_ms(s: string) -> Result<int, string> {
+    let bad = "not a duration: '${s}' (use 500ms, 10s or 1m)";
+    if (s.ends_with("ms")) {
+        return parse_int(s.substring(0, s.len() - 2)).ok_or(bad);
+    }
+    if (s.ends_with("s")) {
+        return parse_int(s.substring(0, s.len() - 1))
+            .map(fn(n: int) -> int { time.seconds(n) })
+            .ok_or(bad);
+    }
+    if (s.ends_with("m")) {
+        return parse_int(s.substring(0, s.len() - 1))
+            .map(fn(n: int) -> int { time.minutes(n) })
+            .ok_or(bad);
+    }
+    Result.Err(bad)
+}
+
+fn flags(argv: [string], from_index: int) -> Result<(Map<string, string>, [string]), string> {
+    let m: Map<string, string> = Map.new();
+    let rest: [string] = [];
+    var i = from_index;
+    while (i < argv.len()) {
+        let a = argv[i];
+        if (a.starts_with("-")) {
+            if (i + 1 >= argv.len()) {
+                return Result.Err("${a} needs a value");
+            }
+            m.insert(a, argv[i + 1]);
+            i = i + 2;
+        } else {
+            rest.push(a);
+            i = i + 1;
+        }
+    }
+    Result.Ok((m, rest))
+}
+
+fn int_flag(m: Map<string, string>, k: string, default: int) -> Result<int, string> {
+    match (m.get(k)) {
+        Option.Some(v) => parse_int(v).ok_or("${k}: not a number: ${v}"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+fn serve(argv: [string]) -> Result<int, string> {
+    let (m, rest) = flags(argv, 1)?;
+    if (rest.len() > 0) {
+        return Result.Err("unexpected '${rest[0]}'\n\n${USAGE}");
+    }
+    let (uh, up) = host_port(m.get_or("--udp", "127.0.0.1:8125"), "--udp")?;
+    let (hh, hp) = host_port(m.get_or("--http", "127.0.0.1:9102"), "--http")?;
+    let qs: [float] = [];
+    for q in m.get_or("--quantiles", "0.5,0.9,0.99").split(",") {
+        let v = parse_float(q.trim()).ok_or("--quantiles: not a number: ${q}")?;
+        if (v <= 0.0 || v > 1.0) {
+            return Result.Err("--quantiles: ${q} is not in (0, 1]");
+        }
+        qs.push(v);
+    }
+    let cfg = server.Config {
+        udp_host: uh,
+        udp_port: up,
+        http_host: hh,
+        http_port: hp,
+        flush_ms: duration_ms(m.get_or("--flush", "10s"))?,
+        window_ms: duration_ms(m.get_or("--window", "1m"))?,
+        receivers: int_flag(m, "--receivers", worker_count())?,
+        quantiles: qs
+    };
+    let listener = server.listen_http(cfg)?;
+    let run = server.start(cfg)?;
+    eprint(
+        "raystat ${VERSION}: statsd on udp ${uh}:${run.udp_port}, /metrics on http://${hh}:${net.local_port(listener)}, ${cfg.receivers} receivers on ${worker_count()} workers, flush every ${cfg.flush_ms} ms, window ${cfg.window_ms} ms"
+    );
+    let never: Channel<int> = Channel.bounded(1);
+    server.serve_http(listener, run, never, false)
+}
+
+fn blast_cmd(argv: [string]) -> Result<int, string> {
+    let (m, rest) = flags(argv, 1)?;
+    if (rest.len() != 1) {
+        return Result.Err("blast needs HOST:PORT\n\n${USAGE}");
+    }
+    let (host, port) = host_port(rest[0], "blast")?;
+    let p = blast.Plan {
+        host: host,
+        port: port,
+        lines: int_flag(m, "-n", 1000000)?,
+        senders: int_flag(m, "-s", 4)?,
+        batch: int_flag(m, "-b", 10)?,
+        series: int_flag(m, "--series", 100)?,
+        rate: int_flag(m, "--rate", 0)?
+    };
+    let (sent, ms, err) = blast.run(p);
+    let per_s = if (ms > 0) { sent * 1000 / ms } else { sent };
+    print("sent ${sent} lines in ${sent / p.batch} datagrams, ${ms} ms: ${per_s} lines/s");
+    if (err != "") {
+        eprint("first send error: ${err}");
+        return Result.Ok(1);
+    }
+    Result.Ok(0)
+}
+
+fn main() -> int {
+    let argv = args();
+    let r = if (argv.len() == 0) {
+        Result.Err(USAGE)
+    } else if (argv[0] == "serve") {
+        serve(argv)
+    } else if (argv[0] == "blast") {
+        blast_cmd(argv)
+    } else if (argv[0] == "--version") {
+        print("raystat ${VERSION}");
+        Result.Ok(0)
+    } else {
+        Result.Err("unknown command '${argv[0]}'\n\n${USAGE}")
+    };
+    match (r) {
+        Result.Ok(c) => c,
+        Result.Err(e) => {
+            eprint("raystat: ${e}");
+            2
+        },
+    }
+}

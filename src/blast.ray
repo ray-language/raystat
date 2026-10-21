@@ -1,0 +1,87 @@
+//! A load generator: `senders` fibers, each with its own socket, sending datagrams of `batch`
+//! statsd lines to a raystat. Every line is a counter increment of 1, so the receiving side can
+//! count exactly how many arrived.
+
+import std/collections/bytesbuilder;
+import std/time;
+import net/udp;
+
+pub struct Plan {
+    host: string,
+    port: int,
+    lines: int,
+    senders: int,
+    batch: int,
+    series: int,
+    /// Datagrams per second per sender (0 = as fast as possible).
+    rate: int,
+}
+
+/// One datagram's payload: `batch` counter lines over `series` series.
+pub fn payload(batch: int, series: int, offset: int) -> bytes {
+    let b = bytesbuilder.new();
+    for i in 0..batch {
+        if (i > 0) {
+            bytesbuilder.push_byte(b, 10);
+        }
+        bytesbuilder.push(b, "blast.hits:1|c|#series:${(offset + i) % series}".to_bytes());
+    }
+    bytesbuilder.build(b)
+}
+
+fn sender(p: Plan, lines: int, id: int, done: Channel<(int, string)>) {
+    let s = match (udp.bind("0.0.0.0", 0)) {
+        Result.Ok(h) => h,
+        Result.Err(e) => {
+            send(done, (0, e));
+            return;
+        },
+    };
+    var sent = 0;
+    var err = "";
+    let started = time.monotonic();
+    var packets = 0;
+    while (sent < lines) {
+        let n = if (lines - sent < p.batch) { lines - sent } else { p.batch };
+        match (udp.send_to(s, p.host, p.port, payload(n, p.series, sent + id))) {
+            Result.Ok(_) => sent = sent + n,
+            Result.Err(e) => {
+                err = e;
+                break;
+            },
+        }
+        packets = packets + 1;
+        if (p.rate > 0) {
+            // Pace against the clock, not by sleeping a fixed amount (no drift).
+            let due = started + packets * 1000 / p.rate;
+            let ahead = due - time.monotonic();
+            if (ahead > 0) {
+                time.sleep(ahead);
+            }
+        }
+    }
+    send(done, (sent, err));
+}
+
+/// Sends the plan; returns (lines sent, milliseconds, first error).
+pub fn run(p: Plan) -> (int, int, string) {
+    let done: Channel<(int, string)> = Channel.bounded(p.senders);
+    let t0 = time.monotonic();
+    let per = p.lines / p.senders;
+    for i in 0..p.senders {
+        let lines = if (i == p.senders - 1) { p.lines - per * (p.senders - 1) } else { per };
+        spawn(fn() {
+            sender(p, lines, i, done);
+        });
+    }
+    var total = 0;
+    var first = "";
+    for _ in 0..p.senders {
+        let (n, e) = recv(done).unwrap_or((0, "lost"));
+        total = total + n;
+        if (first == "" && e != "") {
+            first = e;
+        }
+    }
+    (total, time.monotonic() - t0, first)
+}

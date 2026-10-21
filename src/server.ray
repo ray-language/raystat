@@ -1,0 +1,196 @@
+//! The running service: `receivers` fibers read the one UDP socket, each into its own shard on
+//! its own worker (no message crosses threads per datagram); a coordinator collects the shards
+//! every `flush_ms`, merges them and keeps the rendered `/metrics` page; the HTTP server asks the
+//! coordinator for it.
+
+import std/net;
+import std/time;
+import net/udp;
+import net/webserver;
+import shard;
+import store;
+from shard import Shard;
+from store import Store;
+
+pub struct Config {
+    udp_host: string,
+    udp_port: int,
+    http_host: string,
+    http_port: int,
+    flush_ms: int,
+    /// Timer quantiles and set sizes cover this much (ms).
+    window_ms: int,
+    receivers: int,
+    quantiles: [float],
+}
+
+/// To a receiver: hand over your shard (and start a new one), or stop.
+enum Ctl {
+    Flush(Channel<Shard>),
+    Stop,
+}
+
+/// To the coordinator: the page, a flush now (tests), or stop (after a last flush).
+pub enum Ask {
+    Page(Channel<string>),
+    FlushNow(Channel<int>),
+    Stop(Channel<int>),
+}
+
+/// How long a receiver waits for a datagram before it looks at its control channel.
+const POLL_MS: int = 50;
+
+fn receive(h: int, id: int, ctl: Channel<Ctl>) {
+    // Each receiver sets the timeout itself: in a native binary a timeout set by another fiber
+    // (on another worker) is not honored, and recv_from would wait forever (finding #207).
+    net.set_read_timeout(h, POLL_MS);
+    let w = worker_id();
+    var sh = shard.new(id, w);
+    while (true) {
+        match (udp.recv_from(h)) {
+            Result.Ok(p) => shard.ingest(sh, p.data),
+            Result.Err(_) => { },
+        }
+        match (try_recv(ctl)) {
+            Received.Got(Ctl.Flush(reply)) => {
+                send(reply, sh);
+                sh = shard.new(id, w);
+            },
+            Received.Got(Ctl.Stop) => break,
+            Received.Closed => break,
+            Received.Empty => { },
+        }
+    }
+}
+
+fn collect(ctls: [Channel<Ctl>], st: Store) {
+    let replies: [Channel<Shard>] = [];
+    for c in ctls {
+        let r: Channel<Shard> = Channel.bounded(1);
+        send(c, Ctl.Flush(r));
+        replies.push(r);
+    }
+    let shards: [Shard] = [];
+    for r in replies {
+        if let Option.Some(sh) = recv(r) {
+            shards.push(sh);
+        }
+    }
+    store.merge(st, shards, time.monotonic());
+}
+
+fn coordinate(cfg: Config, ctls: [Channel<Ctl>], asks: Channel<Ask>) {
+    let st = store.new(cfg.quantiles, cfg.window_ms);
+    var page = store.render(st);
+    var next = time.monotonic() + cfg.flush_ms;
+    while (true) {
+        let wait = next - time.monotonic();
+        match (select_timeout([asks], if (wait < 0) { 0 } else { wait })) {
+            Option.Some(_) => match (recv(asks)) {
+                Option.Some(Ask.Page(reply)) => send(reply, page),
+                Option.Some(Ask.FlushNow(reply)) => {
+                    collect(ctls, st);
+                    page = store.render(st);
+                    send(reply, 0);
+                },
+                Option.Some(Ask.Stop(reply)) => {
+                    collect(ctls, st);
+                    for c in ctls {
+                        send(c, Ctl.Stop);
+                    }
+                    send(reply, 0);
+                    break;
+                },
+                Option.None => break,
+            },
+            Option.None => {
+                collect(ctls, st);
+                page = store.render(st);
+                next = next + cfg.flush_ms;
+            },
+        }
+    }
+}
+
+/// A started service: the UDP port it got, and the channel to the coordinator.
+pub struct Running {
+    udp_port: int,
+    asks: Channel<Ask>,
+}
+
+/// Binds the UDP socket and starts the receivers and the coordinator (not the HTTP server).
+pub fn start(cfg: Config) -> Result<Running, string> {
+    let h = udp.bind(cfg.udp_host, cfg.udp_port)?;
+    let ctls: [Channel<Ctl>] = [];
+    for i in 0..cfg.receivers {
+        let c: Channel<Ctl> = Channel.bounded(4);
+        ctls.push(c);
+        spawn(fn() {
+            receive(h, i, c);
+        });
+    }
+    let asks: Channel<Ask> = Channel.bounded(64);
+    spawn(fn() {
+        coordinate(cfg, ctls, asks);
+    });
+    Result.Ok(Running { udp_port: net.local_port(h), asks: asks })
+}
+
+pub fn page(asks: Channel<Ask>) -> string {
+    let reply: Channel<string> = Channel.bounded(1);
+    send(asks, Ask.Page(reply));
+    recv(reply).unwrap_or("")
+}
+
+pub fn flush_now(asks: Channel<Ask>) {
+    let reply: Channel<int> = Channel.bounded(1);
+    send(asks, Ask.FlushNow(reply));
+    let _ = recv(reply);
+}
+
+pub fn stop(asks: Channel<Ask>) {
+    let reply: Channel<int> = Channel.bounded(1);
+    send(asks, Ask.Stop(reply));
+    let _ = recv(reply);
+}
+
+fn handle(req: webserver.Request, asks: Channel<Ask>) -> webserver.Response {
+    if (req.path == "/metrics") {
+        let r = webserver.text(200, page(asks));
+        r.headers.insert("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+        return r;
+    }
+    if (req.path == "/healthz") {
+        return webserver.text(200, "ok\n");
+    }
+    if (req.path == "/") {
+        return webserver.text(200, "raystat: statsd in, Prometheus out. See /metrics.\n");
+    }
+    webserver.not_found()
+}
+
+/// Binds the HTTP listener (port 0 = any free port; see `net.local_port`).
+pub fn listen_http(cfg: Config) -> Result<int, string> {
+    net.tcp_listen(cfg.http_host, cfg.http_port)
+}
+
+/// Serves `/metrics` on `listener` until SIGTERM/SIGINT (or `stop_http` fires, when `has_stop`),
+/// then makes a last flush and stops the receivers.
+pub fn serve_http(
+    listener: int,
+    run: Running,
+    stop_http: Channel<int>,
+    has_stop: bool
+) -> Result<int, string> {
+    let opts = webserver.options();
+    opts.drain_ms = 2000;
+    opts.stop = stop_http;
+    opts.has_stop = has_stop;
+    opts.no_stdout = true;
+    let asks = run.asks;
+    let r = webserver.serve_options_on(listener, opts, fn() -> fn(webserver.Request) -> webserver.Response {
+        fn(req: webserver.Request) -> webserver.Response { handle(req, asks) }
+    });
+    stop(asks);
+    r
+}

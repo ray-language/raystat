@@ -1,0 +1,119 @@
+// Merging shards and rendering the Prometheus page.
+
+import line;
+import shard;
+import store;
+from shard import Shard;
+
+fn feed(id: int, packets: [string]) -> Shard {
+    let sh = shard.new(id, id);
+    for p in packets {
+        shard.ingest(sh, p.to_bytes());
+    }
+    sh
+}
+
+fn lines_of(page: string) -> [string] {
+    page.split("\n")
+}
+
+fn has(page: string, l: string) {
+    if (!lines_of(page).contains(l)) {
+        panic("missing line '${l}' in:\n${page}");
+    }
+}
+
+@test
+fn counters_add_up_across_shards_and_flushes() {
+    let st = store.new([0.5], 60000);
+    store.merge(
+        st,
+        [feed(0, ["hits:1|c|#a:x", "hits:2|c|#a:x"]), feed(1, ["hits:4|c|#a:x\nhits:1|c|#a:y"])],
+        1000
+    );
+    store.merge(st, [feed(0, ["hits:10|c|#a:x"])], 2000);
+    let page = store.render(st);
+    has(page, "# TYPE hits_total counter");
+    has(page, "hits_total{a=\"x\"} 17");
+    has(page, "hits_total{a=\"y\"} 1");
+    has(page, "raystat_lines_total 5");
+    has(page, "raystat_flushes_total 2");
+}
+
+@test
+fn gauges_keep_the_latest_and_move_with_deltas() {
+    let st = store.new([0.5], 60000);
+    let early = feed(0, ["q:5|g"]);
+    let late = feed(1, ["q:9|g"]);
+    // The later write wins, whichever shard comes first in the merge.
+    store.merge(st, [late, early], 1000);
+    has(store.render(st), "q 9");
+    store.merge(st, [feed(0, ["q:+3|g", "q:-1|g"])], 2000);
+    has(store.render(st), "q 11");
+    store.merge(st, [], 3000);
+    has(store.render(st), "q 11");
+}
+
+@test
+fn timers_are_summaries_over_the_window() {
+    let st = store.new([0.5, 0.9, 1.0], 10000);
+    let samples: [string] = [];
+    for i in 1..101 {
+        samples.push("lat:${i}|ms|#r:a");
+    }
+    store.merge(st, [feed(0, samples)], 1000);
+    let page = store.render(st);
+    has(page, "# TYPE lat summary");
+    has(page, "lat{quantile=\"0.5\",r=\"a\"} 50");
+    has(page, "lat{quantile=\"0.9\",r=\"a\"} 90");
+    has(page, "lat{quantile=\"1\",r=\"a\"} 100");
+    has(page, "lat_sum{r=\"a\"} 5050");
+    has(page, "lat_count{r=\"a\"} 100");
+    // An empty flush inside the window keeps the quantiles…
+    store.merge(st, [], 5000);
+    has(store.render(st), "lat{quantile=\"0.5\",r=\"a\"} 50");
+    // …and once the window has passed they go, while _sum and _count stay.
+    store.merge(st, [], 12000);
+    let later = store.render(st);
+    assert(!later.contains("quantile"));
+    has(later, "lat_count{r=\"a\"} 100");
+}
+
+@test
+fn sets_count_distinct_members_in_the_window() {
+    let st = store.new([0.5], 10000);
+    store.merge(st, [feed(0, ["u:ana|s", "u:bob|s"]), feed(1, ["u:ana|s", "u:eva|s"])], 1000);
+    has(store.render(st), "u 3");
+    store.merge(st, [feed(0, ["u:zoe|s"])], 5000);
+    has(store.render(st), "u 4");
+    store.merge(st, [], 12000);
+    has(store.render(st), "u 1");
+}
+
+@test
+fn a_big_timer_keeps_bounded_samples() {
+    let sh = shard.new(0, 0);
+    for i in 0..20000 {
+        shard.ingest(sh, "big:${i}|ms".to_bytes());
+    }
+    let t = sh.timers.get("big").unwrap();
+    assert_eq(t.count, 20000);
+    assert_eq(t.samples.len(), shard.RESERVOIR);
+    assert_eq(t.min, 0.0);
+    assert_eq(t.max, 19999.0);
+    let st = store.new([0.5, 1.0], 60000);
+    store.merge(st, [sh], 1000);
+    let page = store.render(st);
+    // The exact max survives the sampling.
+    has(page, "big{quantile=\"1\"} 19999");
+    has(page, "big_count 20000");
+}
+
+@test
+fn quantiles_by_nearest_rank() {
+    assert_eq(store.quantile([1.0, 2.0, 3.0, 4.0], 0.5), 2.0);
+    assert_eq(store.quantile([1.0, 2.0, 3.0, 4.0], 0.75), 3.0);
+    assert_eq(store.quantile([1.0, 2.0, 3.0, 4.0], 1.0), 4.0);
+    assert_eq(store.quantile([7.0], 0.01), 7.0);
+    assert_eq(store.quantile([], 0.5), 0.0);
+}

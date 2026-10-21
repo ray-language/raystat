@@ -1,0 +1,121 @@
+//! What one receiver collects between flushes. Each receiver fiber owns a shard on its own worker
+//! and nothing else touches it; at a flush it hands the shard over (a copy, over a channel) and
+//! starts an empty one.
+
+import std/random;
+import std/time;
+import line;
+from line import Kind, Sample;
+
+/// Samples kept per timer per shard and interval for the quantiles; past it, a reservoir sample
+/// (count, sum, min and max stay exact).
+pub const RESERVOIR: int = 4096;
+
+pub struct Timer {
+    count: int,
+    sum: float,
+    min: float,
+    max: float,
+    samples: [float],
+}
+
+pub struct Shard {
+    receiver: int,
+    /// The scheduler worker the receiver runs on (`worker_id()`).
+    worker: int,
+    counters: Map<string, float>,
+    /// Absolute gauges with the moment they were set, so the latest wins across shards.
+    gauges: Map<string, (float, int)>,
+    gauge_deltas: Map<string, float>,
+    timers: Map<string, Timer>,
+    sets: Map<string, Map<string, bool>>,
+    /// Series → its metric name, for the `# TYPE` lines.
+    names: Map<string, string>,
+    packets: int,
+    lines: int,
+    bad: int,
+    last_error: string,
+}
+
+pub fn new(receiver: int, worker: int) -> Shard {
+    Shard {
+        receiver: receiver,
+        worker: worker,
+        counters: Map.new(),
+        gauges: Map.new(),
+        gauge_deltas: Map.new(),
+        timers: Map.new(),
+        sets: Map.new(),
+        names: Map.new(),
+        packets: 0,
+        lines: 0,
+        bad: 0,
+        last_error: ""
+    }
+}
+
+pub fn add_timer_value(t: Timer, v: float) {
+    t.count = t.count + 1;
+    t.sum = t.sum + v;
+    if (v < t.min) {
+        t.min = v;
+    }
+    if (v > t.max) {
+        t.max = v;
+    }
+    if (t.samples.len() < RESERVOIR) {
+        t.samples.push(v);
+    } else {
+        // Reservoir sampling: each of the `count` values so far has the same chance to stay.
+        let j = random.below(t.count);
+        if (j < RESERVOIR) {
+            t.samples[j] = v;
+        }
+    }
+}
+
+pub fn add(sh: Shard, s: Sample) {
+    sh.lines = sh.lines + 1;
+    if (!sh.names.contains_key(s.series)) {
+        sh.names.insert(s.series, s.name);
+    }
+    match (s.kind) {
+        Kind.Counter => sh.counters.insert(s.series, sh.counters.get_or(s.series, 0.0) + s.value),
+        Kind.Gauge => {
+            sh.gauges.insert(s.series, (s.value, time.monotonic_nanos()));
+            // An absolute value resets what the deltas had moved.
+            sh.gauge_deltas.remove(s.series);
+        },
+        Kind.GaugeDelta => sh.gauge_deltas.insert(s.series, sh.gauge_deltas.get_or(s.series, 0.0) + s.value),
+        Kind.Timer => match (sh.timers.get(s.series)) {
+            Option.Some(t) => add_timer_value(t, s.value),
+            Option.None => {
+                let t = Timer { count: 0, sum: 0.0, min: s.value, max: s.value, samples: [] };
+                add_timer_value(t, s.value);
+                sh.timers.insert(s.series, t);
+            },
+        },
+        Kind.Set => match (sh.sets.get(s.series)) {
+            Option.Some(m) => m.insert(s.member, true),
+            Option.None => {
+                let m: Map<string, bool> = Map.new();
+                m.insert(s.member, true);
+                sh.sets.insert(s.series, m);
+            },
+        },
+    }
+}
+
+/// Parses a datagram into the shard.
+pub fn ingest(sh: Shard, data: bytes) {
+    sh.packets = sh.packets + 1;
+    let samples: [Sample] = [];
+    let (bad, err) = line.parse_packet(data, samples);
+    for s in samples {
+        add(sh, s);
+    }
+    if (bad > 0) {
+        sh.bad = sh.bad + bad;
+        sh.last_error = err;
+    }
+}
