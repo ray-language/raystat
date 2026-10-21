@@ -100,7 +100,7 @@ make bench         # pérdida y rendimiento por número de receptoras (SERIES=N)
 |---|---|
 | Protocolo, fusión, ventana, página, servicio | **12 tests** en VM y nativo (raylang 1.27.65, net 0.10.1) |
 | De punta a punta | UDP de entrada, `/metrics` por HTTP, 5000 líneas del generador sin pérdida, parada limpia |
-| Windows x86_64 | en CI. En la VM del runner se perdió el 30 % de 5000 líneas enviadas a 2000 datagramas/s, sin forma de agrandar el búfer (#208); ahí el test solo exige que lleguen |
+| Windows x86_64 | en CI. En la VM: en el runner se perdió el 30 % de 5000 líneas enviadas a 2000 datagramas/s, sin forma de agrandar el búfer (#208); ahí el test solo exige que lleguen. En nativo, **el servidor se cuelga**: el `accept` del HTTP bloquea el hilo de su worker y las fibras de ese worker (una receptora, el coordinador…) no vuelven a correr (#222). El test de punta a punta se salta ahí |
 | Windows arm64 | no compila en nativo: `worker_id()` no existe allí (#197) |
 
 Pendiente: histogramas de Prometheus con buckets configurables, persistir los contadores entre
@@ -113,7 +113,10 @@ En `findings/open/raystat-1.27.65.md` del directorio de las apps:
 1. **#207 [B]** En nativo, un plazo de lectura puesto con `net.set_read_timeout` por una fibra no
    vale para `recv_from` en otra fibra: espera para siempre. En la VM sí vale. Dejó `/metrics` sin
    responder hasta que cada receptora se puso el plazo ella misma.
-2. **#208 [E]** `net/udp` no deja agrandar el búfer de recepción (`SO_RCVBUF`) ni compartir el puerto
+2. **#222 [B]** En Windows x86_64 nativo, una fibra en `net.tcp_accept` bloquea el hilo de su
+   worker: el servidor HTTP deja parado un worker entero y lo que caiga en él (una receptora, el
+   coordinador) no vuelve a correr. Encontrado porque el CI se quedaba colgado.
+3. **#208 [E]** `net/udp` no deja agrandar el búfer de recepción (`SO_RCVBUF`) ni compartir el puerto
    (`SO_REUSEPORT`). Las ráfagas se pierden en el kernel.
 
 Además, `spawn_local` y `spawn_isolated` no hicieron falta. Cada receptora hace todo su trabajo en

@@ -2,6 +2,7 @@
 // UDP, the page out on HTTP, flushes, and a clean stop.
 
 import std/net;
+import std/process;
 import std/time;
 import net/udp;
 import blast;
@@ -37,6 +38,12 @@ fn line_value(page: string, prefix: string) -> int {
 
 @test
 fn statsd_in_prometheus_out() {
+    // On Windows x86_64, natively, the HTTP server's accept holds its worker's thread, and the
+    // fibers on that worker never run again (finding #222): the test would hang. Skipped there.
+    if (platform() == "windows" && process.launch_mode() == "native") {
+        eprint("skipped on native Windows: tcp_accept blocks its worker (#222)");
+        return;
+    }
     let cfg = server.Config {
         udp_host: "127.0.0.1",
         udp_port: 0,

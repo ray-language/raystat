@@ -54,6 +54,8 @@ jobs:
           - { os: macos-14,       target: aarch64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
+    # A hung test (a server that never answers) must not hold a runner for hours.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust and the pinned raylang
