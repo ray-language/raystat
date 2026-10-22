@@ -80,9 +80,22 @@ fn statsd_in_prometheus_out() {
     );
     assert_eq(sent, 5000);
     assert_eq(err, "");
-    time.sleep(300);
-    server.flush_now(run.asks);
-    let resp = http_get(http_port, "/metrics");
+    // Wait for the receivers to drain what the socket holds: a slow runner may still be counting.
+    var resp = "";
+    var hits = 0;
+    for _ in 0..50 {
+        time.sleep(100);
+        server.flush_now(run.asks);
+        resp = http_get(http_port, "/metrics");
+        hits = 0;
+        for i in 0..5 {
+            hits = hits + line_value(resp, "blast_hits_total{series=\"${i}\"}");
+        }
+        if (hits == 5000) {
+            break;
+        }
+    }
+    eprint("buffer ${run.recv_buffer}, hits ${hits}");
     assert(resp.starts_with("HTTP/1.1 200"));
     assert(resp.contains("text/plain; version=0.0.4"));
     assert(resp.contains("api_requests_total{method=\"get\"} 3"));
@@ -90,10 +103,6 @@ fn statsd_in_prometheus_out() {
     assert(resp.contains("lat{quantile=\"0.99\"} 30"));
     assert(resp.contains("temp 21.5"));
     assert_eq(line_value(resp, "raystat_bad_lines_total"), 1);
-    var hits = 0;
-    for i in 0..5 {
-        hits = hits + line_value(resp, "blast_hits_total{series=\"${i}\"}");
-    }
     // Paced and local, with a 4 MiB receive buffer: nothing lost.
     assert_eq(hits, 5000);
     assert(http_get(http_port, "/healthz").contains("ok"));
