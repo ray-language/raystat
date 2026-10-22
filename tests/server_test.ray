@@ -2,7 +2,6 @@
 // UDP, the page out on HTTP, flushes, and a clean stop.
 
 import std/net;
-import std/process;
 import std/time;
 import net/udp;
 import blast;
@@ -38,12 +37,6 @@ fn line_value(page: string, prefix: string) -> int {
 
 @test
 fn statsd_in_prometheus_out() {
-    // On Windows x86_64, natively, the HTTP server's accept holds its worker's thread, and the
-    // fibers on that worker never run again (finding #222): the test would hang. Skipped there.
-    if (platform() == "windows" && process.launch_mode() == "native") {
-        eprint("skipped on native Windows: tcp_accept blocks its worker (#222)");
-        return;
-    }
     let cfg = server.Config {
         udp_host: "127.0.0.1",
         udp_port: 0,
@@ -52,7 +45,8 @@ fn statsd_in_prometheus_out() {
         flush_ms: 60000,
         window_ms: 60000,
         receivers: 3,
-        quantiles: [0.5, 0.99]
+        quantiles: [0.5, 0.99],
+        recv_buffer: 4 * 1024 * 1024
     };
     let listener = server.listen_http(cfg).unwrap();
     let http_port = net.local_port(listener);
@@ -100,13 +94,8 @@ fn statsd_in_prometheus_out() {
     for i in 0..5 {
         hits = hits + line_value(resp, "blast_hits_total{series=\"${i}\"}");
     }
-    // Paced and local: nothing lost. Except on Windows, where the CI runner dropped 30 % of
-    // them at this pace (the socket buffer cannot be enlarged, #208): there, some must arrive.
-    if (platform() == "windows") {
-        assert(hits > 0 && hits <= 5000);
-    } else {
-        assert_eq(hits, 5000);
-    }
+    // Paced and local, with a 4 MiB receive buffer: nothing lost.
+    assert_eq(hits, 5000);
     assert(http_get(http_port, "/healthz").contains("ok"));
     assert(http_get(http_port, "/nope").starts_with("HTTP/1.1 404"));
     send(stop_http, 1);

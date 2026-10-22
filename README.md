@@ -7,7 +7,7 @@ datagrama.
 
 ```
 $ raystat serve
-raystat 0.1.0: statsd on udp 127.0.0.1:8125, /metrics on http://127.0.0.1:9102, 11 receivers on 11 workers, flush every 10000 ms, window 60000 ms
+raystat 0.1.0: statsd on udp 127.0.0.1:8125, /metrics on http://127.0.0.1:9102, 11 receivers on 11 workers, receive buffer 8 MiB, flush every 10000 ms, window 60000 ms
 
 $ printf 'api.requests:1|c|#method:get\napi.latency:12|ms' | nc -u -w0 127.0.0.1 8125
 $ curl -s localhost:9102/metrics
@@ -19,7 +19,7 @@ api_requests_total{method="get"} 1
 ```
 
 ```
-raystat serve [--udp HOST:PORT] [--http HOST:PORT] [--flush 10s] [--window 1m] [--receivers N] [--quantiles 0.5,0.9,0.99]
+raystat serve [--udp HOST:PORT] [--http HOST:PORT] [--flush 10s] [--window 1m] [--receivers N] [--recv-buffer 8M] [--quantiles 0.5,0.9,0.99]
 raystat blast HOST:PORT [-n LINES] [-s SENDERS] [-b LINES_PER_DATAGRAM] [--series N] [--rate DATAGRAMS/S]
 ```
 
@@ -61,8 +61,11 @@ src/blast.ray    el generador de carga
   empiezan uno vacío), lo fusiona y guarda la página ya renderizada. El handler HTTP solo pide esa
   página.
 - **Las receptoras miran su canal de control** entre datagramas, o cada 50 ms si no llega nada
-  (plazo de lectura). Ese plazo lo pone cada receptora en su propia fibra: en nativo, un plazo
-  puesto por otra fibra no vale (hallazgo #207).
+  (el plazo de lectura del socket).
+- **Un búfer de recepción grande** (`--recv-buffer`, 8 MiB por defecto, con
+  `net.set_recv_buffer`): una ráfaga que llega más rápido de lo que se lee espera ahí en vez de
+  perderse en el kernel. El SO lo recorta a su máximo (`kern.ipc.maxsockbuf` en macOS,
+  `net.core.rmem_max` en Linux); el arranque dice cuánto puso.
 - **Memoria acotada**: cada temporizador guarda 4096 muestras por receptora y flush (reservorio),
   y 1024 por flush en la ventana. El mínimo y el máximo exactos se conservan.
 
@@ -73,13 +76,14 @@ emisores de 10 líneas por datagrama desde otro proceso, 2 M de líneas en total
 
 | receptoras | 5000 dgram/s por emisor (200 k líneas/s) | 20 000 (800 k líneas/s) | sin freno (~2–3 M líneas/s) |
 |---:|---:|---:|---:|
-| 1 | 0 % perdido | 10 % | 77 % |
-| 2 | 0 % | 0 % | 43 % |
-| 4 | 0 % | 0 % | 29 % |
-| 10 | 0 % | 0 % | 7 % (1,84 M líneas/s recibidas) |
+| 1 | 0 % perdido | 0 % | 65 % |
+| 2 | 0 % | 0 % | 28 % |
+| 4 | 0 % | 0 % | 22 % |
+| 10 | 0 % | 0 % | 0 % (1,81 M líneas/s, todas recibidas) |
 
-Con la carga sin freno, cada receptora más recupera tráfico: el reparto por workers escala. Lo que
-se pierde es lo que no cabe en el búfer del socket, y raylang no deja agrandarlo (#208).
+Con el búfer por defecto del sistema (`--recv-buffer 0`, 768 KiB en macOS) se perdían el 10 % con
+una receptora a 20 000 datagramas/s, y sin freno el 77, 43, 29 y 7 %. Con la carga sin freno, cada
+receptora más recupera tráfico: el reparto por workers escala, y el búfer absorbe el resto.
 
 La fusión de cada flush cuesta según el número de series, no según el tráfico: 1 ms con 100
 series, 24 ms con 10 000, y 100–270 ms con 100 000 (con 10 receptoras).
@@ -98,26 +102,27 @@ make bench         # pérdida y rendimiento por número de receptoras (SERIES=N)
 
 | Qué | Estado |
 |---|---|
-| Protocolo, fusión, ventana, página, servicio | **12 tests** en VM y nativo (raylang 1.27.65, net 0.10.1) |
+| Protocolo, fusión, ventana, página, servicio | **12 tests** en VM y nativo (raylang 1.27.73, net 0.10.1) |
 | De punta a punta | UDP de entrada, `/metrics` por HTTP, 5000 líneas del generador sin pérdida, parada limpia |
-| Windows x86_64 | en CI. En la VM: en el runner se perdió el 30 % de 5000 líneas enviadas a 2000 datagramas/s, sin forma de agrandar el búfer (#208); ahí el test solo exige que lleguen. En nativo, **el servidor se cuelga**: el `accept` del HTTP bloquea el hilo de su worker y las fibras de ese worker (una receptora, el coordinador…) no vuelven a correr (#222). El test de punta a punta se salta ahí |
-| Windows arm64 | no compila en nativo: `worker_id()` no existe allí (#197) |
+| Windows x86_64 | en CI, VM y nativo, con el test de punta a punta entero. Hasta raylang 1.27.73 el servidor se colgaba en nativo (#222) y en la VM se perdía el 30 % de la ráfaga del test (#208) |
+| Windows arm64 | compila en nativo desde 1.27.73 (#197), con un hilo por tarea |
 
 Pendiente: histogramas de Prometheus con buckets configurables, persistir los contadores entre
 reinicios, y TCP como entrada.
 
 ## Hallazgos de dogfood
 
-En `findings/open/raystat-1.27.65.md` del directorio de las apps:
+En `findings/` del directorio de las apps (`closed/2026-10/raystat-1.27.65.md`, y la re-medición
+en `open/raystat-1.27.73.md`). Los tres quedaron arreglados en raylang 1.27.73:
 
-1. **#207 [B]** En nativo, un plazo de lectura puesto con `net.set_read_timeout` por una fibra no
-   vale para `recv_from` en otra fibra: espera para siempre. En la VM sí vale. Dejó `/metrics` sin
-   responder hasta que cada receptora se puso el plazo ella misma.
-2. **#222 [B]** En Windows x86_64 nativo, una fibra en `net.tcp_accept` bloquea el hilo de su
-   worker: el servidor HTTP deja parado un worker entero y lo que caiga en él (una receptora, el
-   coordinador) no vuelve a correr. Encontrado porque el CI se quedaba colgado.
-3. **#208 [E]** `net/udp` no deja agrandar el búfer de recepción (`SO_RCVBUF`) ni compartir el puerto
-   (`SO_REUSEPORT`). Las ráfagas se pierden en el kernel.
+1. **#207 [B]** ✅ En nativo, un plazo de lectura puesto con `net.set_read_timeout` por una fibra no
+   valía para `recv_from` en otra fibra: esperaba para siempre. Dejó `/metrics` sin responder hasta
+   que cada receptora se puso el plazo ella misma. Ahora es del socket, como dice la doc.
+2. **#222 [B]** ✅ En Windows x86_64 nativo, una fibra en `net.tcp_accept` bloqueaba el hilo de su
+   worker: el servidor HTTP dejaba parado un worker entero. Encontrado porque el CI se quedaba
+   colgado; el test se saltaba ahí.
+3. **#208 [E]** ✅ `net/udp` no dejaba agrandar el búfer de recepción (`SO_RCVBUF`), y las ráfagas se
+   perdían en el kernel. Ahora está `net.set_recv_buffer`, y raystat pide 8 MiB.
 
 Además, `spawn_local` y `spawn_isolated` no hicieron falta. Cada receptora hace todo su trabajo en
 su fibra, y `spawn` ya las reparte por los workers.

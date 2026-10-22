@@ -22,6 +22,9 @@ pub struct Config {
     window_ms: int,
     receivers: int,
     quantiles: [float],
+    /// Receive buffer asked of the OS for the UDP socket (bytes; 0 = the OS default). Bursts that
+    /// outrun the receivers wait here instead of being dropped by the kernel.
+    recv_buffer: int,
 }
 
 /// To a receiver: hand over your shard (and start a new one), or stop.
@@ -41,9 +44,6 @@ pub enum Ask {
 const POLL_MS: int = 50;
 
 fn receive(h: int, id: int, ctl: Channel<Ctl>) {
-    // Each receiver sets the timeout itself: in a native binary a timeout set by another fiber
-    // (on another worker) is not honored, and recv_from would wait forever (finding #207).
-    net.set_read_timeout(h, POLL_MS);
     let w = worker_id();
     var sh = shard.new(id, w);
     while (true) {
@@ -115,12 +115,17 @@ fn coordinate(cfg: Config, ctls: [Channel<Ctl>], asks: Channel<Ask>) {
 /// A started service: the UDP port it got, and the channel to the coordinator.
 pub struct Running {
     udp_port: int,
+    /// The receive buffer the OS actually set (0 = left at its default).
+    recv_buffer: int,
     asks: Channel<Ask>,
 }
 
 /// Binds the UDP socket and starts the receivers and the coordinator (not the HTTP server).
 pub fn start(cfg: Config) -> Result<Running, string> {
     let h = udp.bind(cfg.udp_host, cfg.udp_port)?;
+    let buffer = if (cfg.recv_buffer > 0) { net.set_recv_buffer(h, cfg.recv_buffer)? } else { 0 };
+    // The read timeout belongs to the socket, so every receiver gets it.
+    net.set_read_timeout(h, POLL_MS);
     let ctls: [Channel<Ctl>] = [];
     for i in 0..cfg.receivers {
         let c: Channel<Ctl> = Channel.bounded(4);
@@ -133,7 +138,7 @@ pub fn start(cfg: Config) -> Result<Running, string> {
     spawn(fn() {
         coordinate(cfg, ctls, asks);
     });
-    Result.Ok(Running { udp_port: net.local_port(h), asks: asks })
+    Result.Ok(Running { udp_port: net.local_port(h), recv_buffer: buffer, asks: asks })
 }
 
 pub fn page(asks: Channel<Ask>) -> string {

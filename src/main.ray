@@ -1,6 +1,6 @@
 //! raystat: statsd in (UDP), Prometheus out (HTTP).
 //!
-//!   raystat serve [--udp HOST:PORT] [--http HOST:PORT] [--flush 10s] [--receivers N] [--quantiles 0.5,0.9,0.99]
+//!   raystat serve [--udp HOST:PORT] [--http HOST:PORT] [--flush 10s] [--receivers N] [--recv-buffer 8M] [--quantiles 0.5,0.9,0.99]
 //!   raystat blast HOST:PORT [-n LINES] [-s SENDERS] [-b LINES_PER_PACKET] [--series N] [--rate PACKETS/S]
 
 import std/net;
@@ -17,6 +17,7 @@ const USAGE: string = `usage:
     --flush DURATION                how often the receivers' state is merged (default 10s; ms, s, m)
     --window DURATION               what timer quantiles and set sizes cover (default 1m)
     --receivers N                   receiving fibers on the UDP socket (default: one per worker)
+    --recv-buffer SIZE              UDP receive buffer asked of the OS (default 8M; K, M; 0 = OS default)
     --quantiles LIST                timer quantiles (default 0.5,0.9,0.99)
   raystat blast HOST:PORT [options] send counter lines as fast as possible (a load test)
     -n LINES                        default 1000000
@@ -50,6 +51,21 @@ fn duration_ms(s: string) -> Result<int, string> {
     Result.Err(bad)
 }
 
+fn size_bytes(s: string) -> Result<int, string> {
+    let bad = "not a size: '${s}' (use 65536, 512K or 8M)";
+    if (s.ends_with("K")) {
+        return parse_int(s.substring(0, s.len() - 1))
+            .map(fn(n: int) -> int { n * 1024 })
+            .ok_or(bad);
+    }
+    if (s.ends_with("M")) {
+        return parse_int(s.substring(0, s.len() - 1))
+            .map(fn(n: int) -> int { n * 1024 * 1024 })
+            .ok_or(bad);
+    }
+    parse_int(s).ok_or(bad)
+}
+
 fn flags(argv: [string], from_index: int) -> Result<(Map<string, string>, [string]), string> {
     let m: Map<string, string> = Map.new();
     let rest: [string] = [];
@@ -77,6 +93,16 @@ fn int_flag(m: Map<string, string>, k: string, default: int) -> Result<int, stri
     }
 }
 
+fn buffer_text(n: int) -> string {
+    if (n == 0) {
+        "OS default"
+    } else if (n % (1024 * 1024) == 0) {
+        "${n / 1024 / 1024} MiB"
+    } else {
+        "${n} bytes"
+    }
+}
+
 fn serve(argv: [string]) -> Result<int, string> {
     let (m, rest) = flags(argv, 1)?;
     if (rest.len() > 0) {
@@ -100,12 +126,13 @@ fn serve(argv: [string]) -> Result<int, string> {
         flush_ms: duration_ms(m.get_or("--flush", "10s"))?,
         window_ms: duration_ms(m.get_or("--window", "1m"))?,
         receivers: int_flag(m, "--receivers", worker_count())?,
-        quantiles: qs
+        quantiles: qs,
+        recv_buffer: size_bytes(m.get_or("--recv-buffer", "8M"))?
     };
     let listener = server.listen_http(cfg)?;
     let run = server.start(cfg)?;
     eprint(
-        "raystat ${VERSION}: statsd on udp ${uh}:${run.udp_port}, /metrics on http://${hh}:${net.local_port(listener)}, ${cfg.receivers} receivers on ${worker_count()} workers, flush every ${cfg.flush_ms} ms, window ${cfg.window_ms} ms"
+        "raystat ${VERSION}: statsd on udp ${uh}:${run.udp_port}, /metrics on http://${hh}:${net.local_port(listener)}, ${cfg.receivers} receivers on ${worker_count()} workers, receive buffer ${buffer_text(run.recv_buffer)}, flush every ${cfg.flush_ms} ms, window ${cfg.window_ms} ms"
     );
     let never: Channel<int> = Channel.bounded(1);
     server.serve_http(listener, run, never, false)
