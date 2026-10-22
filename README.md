@@ -71,22 +71,24 @@ src/blast.ray    el generador de carga
 
 ## Rendimiento
 
-`make bench` (scripts/bench.sh) en un MacBook (Apple Silicon, 10 núcleos), binario nativo. Son 4
-emisores de 10 líneas por datagrama desde otro proceso, 2 M de líneas en total:
+`make bench` (scripts/bench.sh) en un MacBook (Apple Silicon, 10 núcleos), binario nativo de raylang
+1.27.76. Son 4 emisores de 10 líneas por datagrama desde otro proceso, 2 M de líneas en total:
 
 | receptoras | 5000 dgram/s por emisor (200 k líneas/s) | 20 000 (800 k líneas/s) | sin freno (~2–3 M líneas/s) |
 |---:|---:|---:|---:|
-| 1 | 0 % perdido | 0 % | 65 % |
-| 2 | 0 % | 0 % | 28 % |
-| 4 | 0 % | 0 % | 22 % |
-| 10 | 0 % | 0 % | 0 % (1,81 M líneas/s, todas recibidas) |
+| 1 | 0 % perdido | 0–1 % | 65 % |
+| 2 | 0 % | 0 % | 30 % |
+| 4 | 0 % | 0 % | 11 % |
+| 10 | 0 % | 0 % | 0 % (1,85 M líneas/s, todas recibidas) |
 
-Con el búfer por defecto del sistema (`--recv-buffer 0`, 768 KiB en macOS) se perdían el 10 % con
-una receptora a 20 000 datagramas/s, y sin freno el 77, 43, 29 y 7 %. Con la carga sin freno, cada
-receptora más recupera tráfico: el reparto por workers escala, y el búfer absorbe el resto.
+Una receptora a 20 000 datagramas/s está en el límite: de cuatro pasadas, dos perdieron el 1 %. Con
+el búfer por defecto del sistema (`--recv-buffer 0`, 768 KiB en macOS) se perdían el 10 % con una
+receptora a ese ritmo, y sin freno el 77, 43, 29 y 7 % (medido con raylang 1.27.65). Con la carga sin
+freno, cada receptora más recupera tráfico: el reparto por workers escala, y el búfer absorbe el resto.
 
-La fusión de cada flush cuesta según el número de series, no según el tráfico: 1 ms con 100
-series, 24 ms con 10 000, y 100–270 ms con 100 000 (con 10 receptoras).
+La fusión de cada flush cuesta según el número de series, no según el tráfico (`SERIES=N make
+bench`, con 10 receptoras): 0,1–0,5 ms con 100 series, 17–26 ms con 10 000, y 90–300 ms con 100 000.
+Con raylang 1.27.65 las cifras eran las mismas, salvo la de 100 series (1 ms).
 
 ## Uso
 
@@ -102,7 +104,7 @@ make bench         # pérdida y rendimiento por número de receptoras (SERIES=N)
 
 | Qué | Estado |
 |---|---|
-| Protocolo, fusión, ventana, página, servicio | **12 tests** en VM y nativo (raylang 1.27.73, net 0.10.1) |
+| Protocolo, fusión, ventana, página, servicio | **12 tests** en VM y nativo (raylang 1.27.76, net 0.10.1) |
 | De punta a punta | UDP de entrada, `/metrics` por HTTP, 5000 líneas del generador sin pérdida, parada limpia |
 | Windows x86_64 | en CI, VM y nativo, con el test de punta a punta entero. Hasta raylang 1.27.73 el servidor se colgaba en nativo (#222) y en la VM se perdía el 30 % de la ráfaga del test (#208) |
 | Windows arm64 | compila en nativo desde 1.27.73 (#197), con un hilo por tarea |
